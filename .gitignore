@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 运行时生成的本地设置
+score_mitm_settings.json
+
+# IDE
+.idea/
+.vscode/
