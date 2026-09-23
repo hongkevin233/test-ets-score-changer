@@ -14,6 +14,7 @@
 
 import asyncio
 import ctypes
+import gc
 import inspect
 import json
 import logging as py_logging
@@ -21,8 +22,10 @@ import os
 import queue
 import shutil
 import socket
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -198,6 +201,7 @@ class App:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.thread: threading.Thread | None = None
         self.sysproxy_set = False  # 本次会话是否已由本程序开启系统代理
+        self.last_port = 0  # 最近一次启动代理用的端口, 停止时用于清理占用进程
         self.settings = self._load_settings()
 
         self._build_widgets()
@@ -396,7 +400,7 @@ class App:
         self.btn_stop = ttk.Button(btns, text="停止", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
         ttk.Button(btns, text="导出 CA 证书", command=self.export_cert).pack(side="left", padx=6)
-        ttk.Button(btns, text="清空日志", command=lambda: self.txt_log.delete("1.0", "end")).pack(side="left", padx=6)
+        ttk.Button(btns, text="清空日志", command=self._clear_log).pack(side="left", padx=6)
 
         self.lbl_status = ttk.Label(self.root, text="状态: 未启动", foreground="gray")
         self.lbl_status.pack(anchor="w", padx=8)
@@ -408,6 +412,17 @@ class App:
     # ---------- 逻辑 ----------
     def _log(self, msg: str):
         self.log_q.put(msg)
+
+    def _clear_log(self):
+        # 只清文本框不够: 队列里缓冲的日志会在 100ms 轮询时重新刷回来
+        while True:
+            try:
+                self.log_q.get_nowait()
+            except queue.Empty:
+                break
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
 
     def _poll_log(self):
         lines = []
@@ -477,12 +492,34 @@ class App:
             if self.thread.is_alive():
                 self._log("[error] 上一实例尚未退出, 端口仍被占用; 请稍等几秒再启动")
                 return
-        if not self._port_free(params["listen_port"]):
-            self._log(f"[error] 端口 {params['listen_port']} 已被占用: "
-                      f"可能还开着其他本程序窗口或旧实例未完全退出, 换个端口或稍后再试")
-            self._set_params_state(enabled=True)
-            return
         self._set_params_state(enabled=False)
+        if not self._port_free(params["listen_port"]):
+            # 端口被占: 后台线程尝试自动释放 (等本进程残留关闭 / 强杀其他进程), 成功后自动续启
+            self._log(f"[gui] 端口 {params['listen_port']} 被占用, "
+                      "正在尝试自动释放 (最多 15 秒)...")
+            self.lbl_status.configure(text="状态: 释放端口中...", foreground="#b26a00")
+            threading.Thread(target=self._release_then_start, args=(params,),
+                             daemon=True).start()
+            return
+        self._launch(params)
+
+    def _release_then_start(self, params: dict):
+        ok = self._free_up_port(params["listen_port"])
+
+        def _done():
+            if ok:
+                self._log(f"[gui] 端口 {params['listen_port']} 已释放, 继续启动")
+                self._launch(params)
+            else:
+                self._log(f"[error] 端口 {params['listen_port']} 仍被占用, "
+                          "请换个端口, 或在任务管理器手动结束占用进程")
+                self._set_params_state(enabled=True)
+                self.lbl_status.configure(text="状态: 未启动", foreground="gray")
+
+        self.root.after(0, _done)
+
+    def _launch(self, params: dict):
+        self.last_port = params["listen_port"]
         self.lbl_status.configure(
             text=f"状态: 运行中  0.0.0.0:{params['listen_port']}", foreground="green")
         self.thread = threading.Thread(target=self._run_master, args=(params,), daemon=True)
@@ -534,17 +571,42 @@ class App:
             ret = master.run()
             if inspect.iscoroutine(ret):
                 await ret
+            # mitmproxy 11 的 run() 返回时不会关闭 asyncio 监听 Server,
+            # 端口会一直被本进程占用; 这里显式关闭所有遗留的 Server
+            try:
+                import asyncio.base_events  # noqa: F401
+                leftovers = [o for o in gc.get_objects()
+                             if isinstance(o, asyncio.base_events.Server)]
+                for s in leftovers:
+                    s.close()
+                    try:
+                        await asyncio.wait_for(s.wait_closed(), timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if leftovers:
+                    self._log(f"[gui] 已显式关闭 {len(leftovers)} 个遗留监听服务")
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             loop.run_until_complete(main())
         except Exception as e:  # noqa: BLE001
             self._log(f"[error] mitmproxy 异常退出: {e}")
         finally:
-            # 让循环里排队的日志/回调先跑完, 避免关闭后触发 "Event loop is closed"
+            # 给 shutdown 的收尾回调 (关闭监听 socket 等) 执行时间;
+            # 端口还没真正释放就关循环会留下泄漏的监听 socket
+            for _ in range(20):
+                if self._port_free(params["listen_port"]):
+                    break
+                try:
+                    loop.run_until_complete(asyncio.sleep(0.1))
+                except Exception:  # noqa: BLE001
+                    break
             try:
                 loop.run_until_complete(asyncio.sleep(0.05))
             except Exception:  # noqa: BLE001
                 pass
+            gc.collect()  # 打断 transport 引用环, 确保监听 socket 被 CPython 回收关闭
             self._remove_dead_log_handlers(loop)
             loop.close()
             self._log("[gui] mitmproxy 已停止")
@@ -575,8 +637,87 @@ class App:
             except Exception as e:  # noqa: BLE001
                 self._log(f"[error] 关闭系统代理失败: {e}")
             self.sysproxy_set = False
+        self._kill_port_owners(self.last_port)
         self._set_params_state(enabled=True)
         self.lbl_status.configure(text="状态: 未启动", foreground="gray")
+
+    def _port_owner_pids(self, port: int) -> set:
+        """用 netstat 找出所有 LISTENING 在指定端口上的进程 PID。"""
+        try:
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:  # noqa: BLE001
+            return set()
+        pids = set()
+        for line in out.splitlines():
+            parts = line.split()
+            # 形如: TCP  0.0.0.0:1145  0.0.0.0:0  LISTENING  1234
+            if len(parts) >= 5 and parts[3] == "LISTENING" \
+                    and parts[1].rsplit(":", 1)[-1] == str(port):
+                try:
+                    pid = int(parts[4])
+                except ValueError:
+                    continue
+                if pid:
+                    pids.add(pid)
+        return pids
+
+    def _kill_pid(self, pid: int) -> str:
+        """强杀进程, 返回进程名 (用于日志)。"""
+        name = "?"
+        try:
+            first = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+            if first:
+                name = first[0].split(",")[0].strip('"')
+        except Exception:  # noqa: BLE001
+            pass
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                           capture_output=True, text=True)
+        ok = r.returncode == 0
+        self._log(f"[gui] {'已结束' if ok else '结束失败'}占用进程: {name} (PID {pid})"
+                  + ("" if ok else f": {(r.stderr or r.stdout).strip()}"))
+        return name
+
+    def _free_up_port(self, port: int, timeout: float = 15.0) -> bool:
+        """启动时端口被占的自动处理: 其他进程强杀; 本进程残留则等待并触发 GC 释放。"""
+        deadline = time.time() + timeout
+        tried = set()
+        n = 0
+        while True:
+            owners = self._port_owner_pids(port)
+            others = owners - {os.getpid()}
+            for pid in sorted(others - tried):
+                tried.add(pid)
+                self._log(f"[gui] 端口 {port} 被其他进程占用, 尝试结束它...")
+                self._kill_pid(pid)
+            if self._port_free(port):
+                return True
+            if owners and not others:
+                # 只剩本进程: 泄漏的监听 socket, 触发 GC 回收 transport
+                n += 1
+                gc.collect()
+                if self._port_free(port):
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+
+    def _kill_port_owners(self, port: int):
+        """停止后清理仍占用代理端口的残留进程 (旧实例未正常退出等情况)。"""
+        if not port:
+            return
+        pids = self._port_owner_pids(port)
+        others = pids - {os.getpid()}
+        if not others:
+            if pids:  # 只剩本进程自己, 说明监听正在关闭过程中
+                self._log(f"[gui] 端口 {port} 正在由本进程释放")
+            else:
+                self._log(f"[gui] 端口 {port} 已释放")
+            return
+        for pid in sorted(others):
+            self._kill_pid(pid)
 
     def stop(self):
         if self.master is None:
