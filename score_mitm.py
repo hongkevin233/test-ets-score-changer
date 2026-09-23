@@ -7,7 +7,8 @@
     1. 自动导出 mitmproxy CA 根证书到 D:/cert（.cer / .pem / .p12）
     2. 仅检测 watch_domains 指定域名的 WS 流量（; 分隔，留空检测全部）
     3. 匹配正则 (total_score|accuracy_score|fluency_score|integrity_score|standard_score)="[\\d.]+"
-       并替换为 score_min ~ score_max 区间内的随机数（保留 6 位小数）
+       并替换分数：fixed_scores 非空时用其中的固定值，否则用 score_min ~ score_max 区间随机数
+       （均保留 6 位小数，满分 5.000000）
     4. 二进制帧强制按 latin-1 解码后同样参与匹配
 """
 
@@ -18,6 +19,14 @@ import random
 
 from mitmproxy import ctx, http
 
+SCORE_FIELDS = (
+    "total_score",
+    "accuracy_score",
+    "fluency_score",
+    "integrity_score",
+    "standard_score",
+)
+
 SCORE_PATTERN = re.compile(
     r'(total_score|accuracy_score|fluency_score|integrity_score|standard_score)="[\d.]+"'
 )
@@ -26,6 +35,9 @@ CA_FILES = ("mitmproxy-ca-cert.cer", "mitmproxy-ca-cert.pem", "mitmproxy-ca-cert
 
 
 class ScoreRewriteAddon:
+    def __init__(self):
+        self._fixed = {}  # field -> float
+
     def load(self, loader):
         loader.add_option(
             name="score_min",
@@ -51,6 +63,13 @@ class ScoreRewriteAddon:
             default="",
             help="仅检测这些域名的 WS 流量，以;分隔，留空检测全部",
         )
+        loader.add_option(
+            name="fixed_scores",
+            typespec=str,
+            default="",
+            help="手动指定分数，格式 total_score=4.500000;accuracy_score=...; "
+                 "非空时对应字段用固定值替换（未列出的字段仍走随机区间），留空全部随机",
+        )
 
     def configure(self, updated):
         self._domains = [
@@ -60,6 +79,21 @@ class ScoreRewriteAddon:
         ]
         if self._domains:
             ctx.log.info(f"[score-mitm] 域名过滤: {', '.join(self._domains)}")
+        self._fixed = {}
+        for part in ctx.options.fixed_scores.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            field, _, val = part.partition("=")
+            field = field.strip()
+            if field in SCORE_FIELDS:
+                try:
+                    self._fixed[field] = float(val)
+                except ValueError:
+                    ctx.log.warn(f"[score-mitm] 忽略非法固定分值: {part}")
+        if self._fixed:
+            ctx.log.info(f"[score-mitm] 固定分数模式: "
+                         + ", ".join(f"{k}={v:.6f}" for k, v in sorted(self._fixed.items())))
         self._export_ca()
 
     def running(self):
@@ -120,9 +154,21 @@ class ScoreRewriteAddon:
         text, codec = self._decode(message.content)
 
         def _replace(m: re.Match) -> str:
-            val = self._random_score()
-            ctx.log.info(f'[score-mitm] 命中: {m.group(0)} -> {m.group(1)}="{val}"')
-            return f'{m.group(1)}="{val}"'
+            field = m.group(1)
+            if field in self._fixed:
+                val = f"{self._fixed[field]:.6f}"
+            elif (field == "total_score"
+                  and "total_score" not in self._fixed
+                  and all(f in self._fixed for f in ("accuracy_score", "fluency_score", "integrity_score"))):
+                # 分项模式: 总分 = 三个分项的平均数
+                avg = (self._fixed["accuracy_score"]
+                       + self._fixed["fluency_score"]
+                       + self._fixed["integrity_score"]) / 3
+                val = f"{avg:.6f}"
+            else:
+                val = self._random_score()
+            ctx.log.info(f'[score-mitm] 命中: {m.group(0)} -> {field}="{val}"')
+            return f'{field}="{val}"'
 
         new_text, count = SCORE_PATTERN.subn(_replace, text)
         if count:

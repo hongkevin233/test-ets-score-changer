@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
-from score_mitm import CA_FILES, ScoreRewriteAddon
+from score_mitm import CA_FILES, SCORE_FIELDS, ScoreRewriteAddon
 
 # --windowed 打包模式下没有控制台, stdout/stderr 为 None;
 # 重定向到空设备, 避免任何库写控制台时崩溃
@@ -66,6 +66,76 @@ def set_system_proxy(enable: bool, proxy: str = ""):
     wininet = ctypes.windll.wininet
     wininet.InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0)
     wininet.InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0)
+
+
+class RangeSlider(tk.Canvas):
+    """双把手区间滑块: 一个滑槽两个滑块, 拖动确定 [下限, 上限]。"""
+
+    def __init__(self, master, lo=0.0, hi=5.0, value_low=3.0, value_high=5.0,
+                 on_change=None, width=420, height=44, **kw):
+        super().__init__(master, width=width, height=height, highlightthickness=0, **kw)
+        self.lo, self.hi = lo, hi
+        self.vlo = min(value_low, value_high)
+        self.vhi = max(value_low, value_high)
+        self.on_change = on_change
+        self.pad = 14
+        self.track_y = height // 2
+        self.dragging = None
+        self.enabled = True
+        self.bind("<Button-1>", self._press)
+        self.bind("<B1-Motion>", self._move)
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def _x2v(self, x):
+        w = int(self["width"]) - 2 * self.pad
+        frac = min(max((x - self.pad) / w, 0.0), 1.0)
+        return self.lo + frac * (self.hi - self.lo)
+
+    def _v2x(self, v):
+        w = int(self["width"]) - 2 * self.pad
+        return self.pad + (v - self.lo) / (self.hi - self.lo) * w
+
+    def _press(self, e):
+        if not self.enabled:
+            return
+        xlo, xhi = self._v2x(self.vlo), self._v2x(self.vhi)
+        self.dragging = "lo" if abs(e.x - xlo) <= abs(e.x - xhi) else "hi"
+        self._move(e)
+
+    def _move(self, e):
+        if not self.enabled or self.dragging is None:
+            return
+        v = round(self._x2v(e.x), 6)
+        if self.dragging == "lo":
+            self.vlo = min(v, self.vhi)
+        else:
+            self.vhi = max(v, self.vlo)
+        self._draw()
+        if self.on_change:
+            self.on_change(self.vlo, self.vhi)
+
+    def _release(self, e):
+        self.dragging = None
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = int(self["width"])
+        track = "#d5d5d5" if self.enabled else "#eeeeee"
+        fill = "#4a90d9" if self.enabled else "#c0c0c0"
+        handle = "#2f6fb3" if self.enabled else "#9a9a9a"
+        self.create_rectangle(self.pad, self.track_y - 3, w - self.pad, self.track_y + 3,
+                              fill=track, width=0)
+        self.create_rectangle(self._v2x(self.vlo), self.track_y - 3, self._v2x(self.vhi),
+                              self.track_y + 3, fill=fill, width=0)
+        for v in (self.vlo, self.vhi):
+            x = self._v2x(v)
+            self.create_oval(x - 7, self.track_y - 7, x + 7, self.track_y + 7,
+                             fill=handle, outline="white")
 
 
 class LogSink:
@@ -134,6 +204,47 @@ class App:
         self.root.after(100, self._poll_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ---------- 滑块回调 ----------
+    def _on_range_change(self, vlo: float, vhi: float):
+        self.lbl_rlo.configure(text=f"下限 {vlo:.6f}")
+        self.lbl_rhi.configure(text=f"上限 {vhi:.6f}")
+
+    def _on_manual_toggle(self):
+        manual = self.var_manual.get()
+        self.rslider.set_enabled(not manual and not self.var_sub.get())
+        for w in (self.lbl_rlo, self.lbl_rhi):
+            w.configure(foreground="#aaaaaa" if (manual or self.var_sub.get()) else "#2f6fb3")
+        state = "normal" if manual else "disabled"
+        self.slider_manual.configure(state=state)
+        self.lbl_manual.configure(foreground="#b26a00" if manual else "#aaaaaa")
+        if manual:
+            self._on_manual_change(str(self.slider_manual.get()))
+        if self.var_sub.get():
+            # 分项模式优先: 统一滑块和其开关保持禁用
+            self.slider_manual.configure(state="disabled")
+            self.chk_manual.configure(state="disabled")
+
+    def _on_manual_change(self, value: str):
+        if self.var_manual.get():
+            self.lbl_manual.configure(text=f"{float(value):.6f}")
+
+    def _on_sub_change(self, field: str, value: str):
+        if self.var_sub.get():
+            self.sub_labels[field].configure(text=f"{float(value):.6f}")
+
+    def _on_sub_toggle(self):
+        sub = self.var_sub.get()
+        for scale in self.sub_scales.values():
+            scale.configure(state="normal" if sub else "disabled")
+        for lbl in self.sub_labels.values():
+            lbl.configure(foreground="#2e7d32" if sub else "#aaaaaa")
+        # 分项模式启用时, 统一改分滑块与其开关禁用; 关闭后还原
+        self.slider_manual.configure(state="disabled" if sub else
+                                     ("normal" if self.var_manual.get() else "disabled"))
+        self.chk_manual.configure(state="disabled" if sub else "normal")
+        if sub:
+            self.lbl_manual.configure(foreground="#aaaaaa")
+
     # ---------- 设置持久化 ----------
     @staticmethod
     def _app_dir() -> Path:
@@ -159,8 +270,14 @@ class App:
     def _save_settings(self):
         try:
             data = {
-                "score_min": self.e_min.get(),
-                "score_max": self.e_max.get(),
+                "score_mode": "sub" if self.var_sub.get() else
+                              ("manual" if self.var_manual.get() else "random"),
+                "sub_mode": self.var_sub.get(),
+                **{f"sub_{f}": f"{self.sub_scales[f].get():.6f}"
+                   for f in ("accuracy_score", "fluency_score", "integrity_score")},
+                "range_min": f"{self.rslider.vlo:.6f}",
+                "range_max": f"{self.rslider.vhi:.6f}",
+                "manual_score": f"{self.slider_manual.get():.6f}",
                 "listen_port": self.e_port.get(),
                 "watch_domains": self.e_domains.get(),
                 "cert_export_dir": self.e_certdir.get(),
@@ -183,20 +300,10 @@ class App:
         frm = ttk.LabelFrame(self.root, text="参数设置")
         frm.pack(fill="x", **pad)
 
-        ttk.Label(frm, text="分数下限 score_min:").grid(row=0, column=0, sticky="e", **pad)
-        self.e_min = ttk.Entry(frm, width=12)
-        self.e_min.insert(0, self.settings.get("score_min", "3.000000"))
-        self.e_min.grid(row=0, column=1, sticky="w", **pad)
-
-        ttk.Label(frm, text="分数上限 score_max:").grid(row=0, column=2, sticky="e", **pad)
-        self.e_max = ttk.Entry(frm, width=12)
-        self.e_max.insert(0, self.settings.get("score_max", "5.000000"))
-        self.e_max.grid(row=0, column=3, sticky="w", **pad)
-
-        ttk.Label(frm, text="监听端口:").grid(row=0, column=4, sticky="e", **pad)
+        ttk.Label(frm, text="监听端口:").grid(row=0, column=0, sticky="e", **pad)
         self.e_port = ttk.Entry(frm, width=8)
         self.e_port.insert(0, str(self.settings.get("listen_port", "8080")))
-        self.e_port.grid(row=0, column=5, sticky="w", **pad)
+        self.e_port.grid(row=0, column=1, sticky="w", **pad)
 
         ttk.Label(frm, text="监控域名 (; 分隔, 留空全部):").grid(row=1, column=0, sticky="e", **pad)
         self.e_domains = ttk.Entry(frm, width=52)
@@ -224,6 +331,63 @@ class App:
         ).grid(row=4, column=0, columnspan=6, sticky="w", **pad)
 
         frm.columnconfigure(1, weight=1)
+
+        # ---- 分数设置: 双滑块随机区间 / 勾选后单滑块手动定值 ----
+        sf = ttk.LabelFrame(self.root, text="分数设置 (满分 5.000000, 保留 6 位小数)")
+        sf.pack(fill="x", **pad)
+
+        # 双滑块: 一个滑槽两个把手, 确定随机区间 [下限, 上限]
+        self.rslider = RangeSlider(
+            sf,
+            value_low=float(self.settings.get("range_min", 3.0)),
+            value_high=float(self.settings.get("range_max", 5.0)),
+            on_change=self._on_range_change,
+        )
+        self.rslider.grid(row=0, column=0, columnspan=3, sticky="we", padx=10)
+        self.lbl_rlo = ttk.Label(sf, text="", foreground="#2f6fb3")
+        self.lbl_rlo.grid(row=1, column=0, sticky="w", padx=10)
+        self.lbl_rhi = ttk.Label(sf, text="", foreground="#2f6fb3")
+        self.lbl_rhi.grid(row=1, column=2, sticky="e", padx=10)
+        self._on_range_change(self.rslider.vlo, self.rslider.vhi)
+
+        # 手动改分开关: 勾选后双滑块禁用, 换成单滑块定值
+        self.var_manual = tk.BooleanVar(value=self.settings.get("score_mode", "random") == "manual")
+        self.chk_manual = ttk.Checkbutton(
+            sf, text="手动改分 (所有字段替换为固定值)", variable=self.var_manual,
+            command=self._on_manual_toggle)
+        self.chk_manual.grid(row=2, column=0, sticky="w", padx=10, pady=(6, 0))
+
+        self.slider_manual = ttk.Scale(sf, from_=0.0, to=5.0, orient="horizontal",
+                                       command=self._on_manual_change)
+        self.slider_manual.set(float(self.settings.get("manual_score", 4.5)))
+        self.slider_manual.grid(row=3, column=0, columnspan=2, sticky="we", padx=10, pady=(0, 4))
+        self.lbl_manual = ttk.Label(sf, text=f"{float(self.settings.get('manual_score', 4.5)):.6f}",
+                                    width=9, foreground="#b26a00")
+        self.lbl_manual.grid(row=3, column=2, sticky="w", padx=10, pady=(0, 4))
+
+        # 分项改分: 分别设置 accuracy/fluency/integrity, 总分 = 三者平均
+        self.var_sub = tk.BooleanVar(value=self.settings.get("sub_mode", False))
+        self.chk_sub = ttk.Checkbutton(
+            sf, text="分项改分 (分别设置三个分项, 总分 = 平均数, 启用后上方滑块禁用)",
+            variable=self.var_sub, command=self._on_sub_toggle)
+        self.chk_sub.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
+
+        self.sub_scales = {}
+        self.sub_labels = {}
+        for i, field in enumerate(("accuracy_score", "fluency_score", "integrity_score")):
+            ttk.Label(sf, text=field).grid(row=5 + i, column=0, sticky="w", padx=10)
+            scale = ttk.Scale(sf, from_=0.0, to=5.0, orient="horizontal",
+                              command=lambda v, f=field: self._on_sub_change(f, v))
+            scale.set(float(self.settings.get(f"sub_{field}", 4.5)))
+            scale.grid(row=5 + i, column=1, sticky="we", padx=6)
+            lbl = ttk.Label(sf, text=f"{scale.get():.6f}", width=9, foreground="#2e7d32")
+            lbl.grid(row=5 + i, column=2, sticky="w")
+            self.sub_scales[field] = scale
+            self.sub_labels[field] = lbl
+        self._on_manual_toggle()
+        self._on_sub_toggle()
+        sf.columnconfigure(0, weight=1)
+        sf.columnconfigure(1, weight=2)
 
         btns = ttk.Frame(self.root)
         btns.pack(fill="x", **pad)
@@ -260,28 +424,44 @@ class App:
 
     def _set_params_state(self, enabled: bool):
         state = "normal" if enabled else "disabled"
-        for w in (self.e_min, self.e_max, self.e_port, self.e_domains, self.e_certdir):
+        for w in (self.e_port, self.e_domains, self.e_certdir, self.chk_manual, self.chk_sub):
             w.configure(state=state)
+        if enabled:
+            # 恢复时按开关状态还原各滑块可用性
+            self._on_sub_toggle()
+            self._on_manual_toggle()
+        else:
+            self.rslider.set_enabled(False)
+            self.slider_manual.configure(state="disabled")
+            for scale in self.sub_scales.values():
+                scale.configure(state="disabled")
         self.btn_start.configure(state=state)
         self.btn_stop.configure(state="normal" if not enabled else "disabled")
 
     def _validate(self) -> dict | None:
         try:
-            lo = float(self.e_min.get())
-            hi = float(self.e_max.get())
             port = int(self.e_port.get())
         except ValueError:
-            messagebox.showerror("参数错误", "分数和端口必须是数字")
-            return None
-        if not (0 <= lo <= 5 and 0 <= hi <= 5):
-            messagebox.showerror("参数错误", "分数满分 5.000000, 请输入 0~5 之间的数值")
+            messagebox.showerror("参数错误", "端口必须是数字")
             return None
         if not (1 <= port <= 65535):
             messagebox.showerror("参数错误", "端口范围 1-65535")
             return None
+        if self.var_sub.get():
+            # 分项模式: accuracy/fluency/integrity 各自定值, 总分由插件取平均
+            fixed_scores = ";".join(
+                f"{f}={self.sub_scales[f].get():.6f}"
+                for f in ("accuracy_score", "fluency_score", "integrity_score"))
+        elif self.var_manual.get():
+            # 手动模式: 所有字段用单滑块的固定值
+            fixed = f"{self.slider_manual.get():.6f}"
+            fixed_scores = ";".join(f"{f}={fixed}" for f in SCORE_FIELDS)
+        else:
+            fixed_scores = ""
         return {
-            "score_min": f"{lo:.6f}",
-            "score_max": f"{hi:.6f}",
+            "score_min": f"{self.rslider.vlo:.6f}",
+            "score_max": f"{self.rslider.vhi:.6f}",
+            "fixed_scores": fixed_scores,
             "listen_port": port,
             "watch_domains": self.e_domains.get().strip(),
             "cert_export_dir": self.e_certdir.get().strip() or "D:/cert",
@@ -334,9 +514,20 @@ class App:
             master.options.update(
                 score_min=params["score_min"],
                 score_max=params["score_max"],
+                fixed_scores=params["fixed_scores"],
                 watch_domains=params["watch_domains"],
                 cert_export_dir=params["cert_export_dir"],
             )
+            fs = params["fixed_scores"]
+            if "accuracy_score=" in fs and "total_score" not in fs:
+                mode = "分项改分 (总分=平均)"
+            elif fs:
+                mode = "手动定值"
+            else:
+                mode = "随机区间"
+            self._log(f"[gui] 分数模式: {mode}"
+                      + (f" [{fs}]" if fs else
+                         f" [{params['score_min']}, {params['score_max']}]"))
             self.master = master
             self._log(f"[gui] 已启动, 监听 0.0.0.0:{params['listen_port']}, 请将客户端代理指向本机该端口")
             # 兼容 run() 为协程或普通方法的版本
