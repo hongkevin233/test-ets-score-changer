@@ -207,6 +207,8 @@ class App:
         self._build_widgets()
         self.root.after(100, self._poll_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 首次使用自动安装根证书 (后台线程, 已装则跳过)
+        threading.Thread(target=self._ensure_ca_cert, daemon=True).start()
 
     # ---------- 滑块回调 ----------
     def _on_range_change(self, vlo: float, vhi: float):
@@ -767,6 +769,90 @@ class App:
                 self._log(f"[gui] {DEFAULT_CONFDIR} 下未找到 CA 证书, 请先启动一次代理让其生成")
         except Exception as e:  # noqa: BLE001
             self._log(f"[error] 导出证书失败: {e}")
+
+    # ---------- CA 根证书自动安装 ----------
+    def _ensure_ca_file(self) -> Path | None:
+        """确保 ~/.mitmproxy 下存在 CA 证书文件 (.cer); 没有则生成/转换。"""
+        cer = Path(DEFAULT_CONFDIR) / "mitmproxy-ca-cert.cer"
+        if cer.is_file():
+            return cer
+        try:
+            from mitmproxy.certs import CertStore
+            os.makedirs(DEFAULT_CONFDIR, exist_ok=True)
+            CertStore.from_store(DEFAULT_CONFDIR, "mitmproxy", 2048)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[error] 生成根证书失败: {e}")
+            return None
+        if cer.is_file():
+            return cer
+        # 某些版本只写 pem, 转成 der 供 certutil 使用
+        for pem_name in ("mitmproxy-ca-cert.pem", "mitmproxy-ca.pem"):
+            pem = Path(DEFAULT_CONFDIR) / pem_name
+            if pem.is_file():
+                try:
+                    from cryptography import x509
+                    from cryptography.hazmat.primitives.serialization import Encoding
+                    cert = x509.load_pem_x509_certificate(pem.read_bytes())
+                    cer.write_bytes(cert.public_bytes(Encoding.DER))
+                    return cer
+                except Exception as e:  # noqa: BLE001
+                    self._log(f"[error] 转换证书格式失败: {e}")
+                    return None
+        return None
+
+    def _ca_thumbprint(self, cer: Path) -> str | None:
+        # certutil 输出是本地代码页 (中文 Windows 为 GBK), 显式指定避免解码崩溃
+        r = subprocess.run(["certutil", "-hashfile", str(cer), "SHA1"],
+                           capture_output=True, timeout=30,
+                           encoding="gbk", errors="replace")
+        for ln in r.stdout.splitlines():
+            s = ln.strip().replace(" ", "")
+            if len(s) == 40 and all(c in "0123456789abcdefABCDEF" for c in s):
+                return s.lower()
+        return None
+
+    def _ca_in_store(self, tp: str) -> bool:
+        for args in (["certutil", "-user", "-store", "Root"],
+                     ["certutil", "-store", "Root"]):
+            try:
+                r = subprocess.run(args, capture_output=True, timeout=30,
+                                   encoding="gbk", errors="replace")
+                blob = (r.stdout + r.stderr).replace(" ", "").lower()
+                if tp in blob:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    def _ensure_ca_cert(self):
+        """首次使用自动安装 mitmproxy 根证书到当前用户受信任的根证书存储 (已装则跳过)。"""
+        if not IS_WINDOWS:
+            return
+        try:
+            cer = self._ensure_ca_file()
+            if cer is None:
+                self._log("[gui] 根证书文件不可用, 暂时跳过自动安装")
+                return
+            tp = self._ca_thumbprint(cer)
+            if tp is None:
+                self._log("[gui] 无法计算根证书指纹, 跳过自动安装")
+                return
+            if self._ca_in_store(tp):
+                self._log("[gui] 根证书已安装, 无需重复安装")
+                return
+            self._log("[gui] 首次使用: 正在安装根证书到当前用户受信任的根证书存储...")
+            # -user 存储无需管理员权限; 若系统策略拒绝, 走导出按钮手动装
+            r = subprocess.run(["certutil", "-user", "-addstore", "Root", str(cer)],
+                               capture_output=True, timeout=60,
+                               encoding="gbk", errors="replace")
+            if r.returncode == 0:
+                self._log(f"[gui] 根证书已安装成功 ({cer})")
+            else:
+                self._log(f"[error] 根证书自动安装失败 (certutil {r.returncode}): "
+                          f"{(r.stderr or r.stdout).strip()[:200]}")
+                self._log("[gui] 可点「导出 CA 证书」拿到文件后手动双击安装")
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[error] 自动安装根证书异常: {e}")
 
     def _on_close(self):
         # 不做优雅退出: 保存设置、关闭系统代理后直接结束进程,
