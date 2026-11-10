@@ -4,6 +4,8 @@
 
 const ORIGIN = "https://release.dianetwork.top";
 const CACHE_TTL = 86400;
+// 更新 R2 上的同名文件后把这个值 +1 再重新部署, 边缘缓存立即失效
+const CACHE_VERSION = 2;
 
 export default {
   async fetch(request) {
@@ -15,14 +17,15 @@ export default {
     }
 
     const cache = caches.default;
-    const cached = await cache.match(request);
+    const cacheKey = new Request(`${url.origin}${url.pathname}?cachev=${CACHE_VERSION}`);
+    const cached = await cache.match(cacheKey);
     if (cached) {
       return cached;
     }
 
     const res = await fetch(originUrl, request);
     if (res.status === 200) {
-      await cache.put(request, res.clone());
+      await cache.put(cacheKey, res.clone());
       const out = new Response(res.body, res);
       out.headers.set("Cache-Control", `public, max-age=${CACHE_TTL}`);
       return out;
