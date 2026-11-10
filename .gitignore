@@ -19,3 +19,10 @@ score_mitm_settings.json
 
 # wrangler 本地缓存
 .wrangler/
+
+# 证书与私钥 - CA 私钥泄露可伪造任意网站证书, 严禁入库
+mitmproxy-ca*
+*.pem
+*.key
+*.p12
+*.pfx
