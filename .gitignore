@@ -16,3 +16,6 @@ score_mitm_settings.json
 
 # cf CLI 本地状态 (含凭据)
 .cloudflare/
+
+# wrangler 本地缓存
+.wrangler/
