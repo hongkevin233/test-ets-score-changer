@@ -32,6 +32,45 @@ from tkinter import messagebox, scrolledtext, ttk
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+
+def _patch_passlib_bcrypt_compat():
+    """passlib 1.7.4 与 bcrypt>=4.1 不兼容 (导入 mitmproxy 时会触发):
+    1) passlib 读取 bcrypt.__about__.__version__ 失败
+    2) 自检时用超长密码调 hashpw, 新版 bcrypt 直接抛 ValueError
+    这里做最小兼容补丁, 不改动已安装的依赖版本。"""
+    try:
+        import bcrypt as _bcrypt
+    except Exception:  # noqa: BLE001
+        return
+
+    if not hasattr(_bcrypt, "__about__"):
+        about = type("_About", (), {})()
+        about.__version__ = getattr(_bcrypt, "__version__", "0")
+        _bcrypt.__about__ = about
+
+    def _clip(pw):
+        if isinstance(pw, (bytes, bytearray)) and len(pw) > 72:
+            return bytes(pw[:72])
+        return pw
+
+    _orig_hashpw = _bcrypt.hashpw
+    if not getattr(_orig_hashpw, "_score_mitm_patched", False):
+        def _hashpw(password, salt):
+            return _orig_hashpw(_clip(password), salt)
+
+        _hashpw._score_mitm_patched = True
+        _bcrypt.hashpw = _hashpw
+
+        _orig_checkpw = _bcrypt.checkpw
+
+        def _checkpw(password, hashed_password):
+            return _orig_checkpw(_clip(password), hashed_password)
+
+        _bcrypt.checkpw = _checkpw
+
+
+_patch_passlib_bcrypt_compat()
+
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 

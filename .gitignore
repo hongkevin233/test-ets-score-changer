@@ -13,3 +13,6 @@ score_mitm_settings.json
 # IDE
 .idea/
 .vscode/
+
+# cf CLI 本地状态 (含凭据)
+.cloudflare/
